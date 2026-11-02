@@ -103,17 +103,23 @@ test("a payload for another model is left alone", async () => {
   assert.equal(r.requests.length, 1);
 });
 
-// Break caught: sending the request twice when an earlier recovery already owns it.
-test("an existing settlement continuation is respected", async () => {
+// Break caught: a later settlement owner must share the prepared repair rather
+// than bypass ID cleanup or cause a third request. It does not need to edit history.
+for (const order of ["owner-first", "repair-first"]) test(`existing settlement continuation reuses prepared repair (${order})`, async () => {
   let handled = false;
-  const r = await runFixture(["resource", "ok"], { precedingExtension: (pi) => {
+  const owner = (pi) => {
     pi.on("agent_before_settle", (event) => {
       if (handled || event.outcome !== "error") return;
       handled = true;
-      const entry = event.context.contextEntries.findLast((x) => x.messages.some((m) => m.role === "assistant"));
-      return { entries: [{ type: "context_edit", targetId: entry.sourceEntry.id, replacement: null }], continue: true };
+      return { continue: true };
     });
-  } });
+  };
+  const r = await runFixture(["resource", "ok"], {
+    [order === "owner-first" ? "precedingExtension" : "trailingExtension"]: owner,
+  });
   assert.equal(r.requests.length, 2);
-  assert.equal(r.requests[1].input.some((x) => x.id === "rs_history"), true);
+  assert.equal(r.requests[1].input.some((x) => x.id === "rs_history"), false);
+  assert.equal(r.requests[1].input.some((x) => x.type === "reasoning"), true, "the owner must not remove unrelated historical context");
+  assert.equal(r.entries.filter((e) => e.type === "context_edit").length, 1);
+  assert.deepEqual(r.extensionErrors, []);
 });

@@ -8,6 +8,7 @@ type SelectedModel = NonNullable<ExtensionContext["model"]>;
 type WirePayload = Record<string, unknown> & { model: string; input: unknown[] };
 type StateChange =
   | { kind: "rejected"; scope: string; ids: string[] }
+  | { kind: "clean-next"; scope: string }
   | { kind: "reset"; scope: string }
   | { kind: "mode"; enabled: boolean };
 interface Snapshot {
@@ -27,20 +28,23 @@ function scopeOf(model: SelectedModel): string {
   return createHash("sha256").update(JSON.stringify([model.provider, model.api, model.baseUrl, model.id])).digest("hex");
 }
 
-function readPolicy(ctx: ExtensionContext, scope?: string): { enabled: boolean; ids: Set<string> } {
+function readPolicy(ctx: ExtensionContext, scope?: string): { enabled: boolean; ids: Set<string>; cleanNext: boolean } {
   let enabled = true;
+  let cleanNext = false;
   const ids = new Set<string>();
   for (const entry of ctx.sessionManager.getBranch()) {
     if (entry.type !== "custom" || entry.customType !== STATE_TYPE || !isRecord(entry.data)) continue;
     const data = entry.data;
     if (data.kind === "mode" && typeof data.enabled === "boolean") enabled = data.enabled;
     if (scope === undefined || data.scope !== scope) continue;
-    if (data.kind === "reset") ids.clear();
+    if (data.kind === "reset") { ids.clear(); cleanNext = false; }
+    if (data.kind === "clean-next") cleanNext = true;
     if (data.kind === "rejected" && Array.isArray(data.ids)) {
+      cleanNext = false;
       for (const id of data.ids) if (typeof id === "string") ids.add(id);
     }
   }
-  return { enabled, ids };
+  return { enabled, ids, cleanNext };
 }
 
 function eligible(payload: unknown, model: SelectedModel): payload is WirePayload {
@@ -51,9 +55,14 @@ function eligible(payload: unknown, model: SelectedModel): payload is WirePayloa
     && !payload.input.some((item) => isRecord(item) && item.type === "item_reference");
 }
 
-/** Recover only an unambiguous, empty Azure resource-identity rejection. */
+function itemIds(input: unknown[]): string[] {
+  return [...new Set(input.flatMap((item) => isRecord(item) && typeof item.id === "string" ? [item.id] : []))];
+}
+
+/** Recover narrow Azure identity errors and support explicit history-ID cleanup. */
 export default function azureCompat(pi: ExtensionAPI): void {
   let snapshot: Snapshot | undefined;
+  let pendingContinuationScope: string | undefined;
   let inTurn = false;
   let requestsInTurn = 0;
   let recoveriesInOperation = 0;
@@ -61,6 +70,7 @@ export default function azureCompat(pi: ExtensionAPI): void {
 
   function clearOperation(): void {
     snapshot = undefined;
+    pendingContinuationScope = undefined;
     inTurn = false;
     requestsInTurn = 0;
     recoveriesInOperation = 0;
@@ -73,10 +83,11 @@ export default function azureCompat(pi: ExtensionAPI): void {
   pi.on("agent_settled", clearOperation);
   pi.on("turn_start", () => {
     snapshot = undefined;
+    // Any next turn, including an agent_end fallback, consumes the prepared repair.
+    pendingContinuationScope = undefined;
     inTurn = true;
     requestsInTurn = 0;
   });
-  pi.on("turn_end", () => { inTurn = false; });
 
   pi.on("before_provider_request", ({ payload }, ctx) => {
     // Idle/background calls cannot replace a captured main-turn request.
@@ -89,6 +100,14 @@ export default function azureCompat(pi: ExtensionAPI): void {
     const scope = scopeOf(model);
     const policy = readPolicy(ctx, scope);
     if (!policy.enabled) return;
+    if (policy.cleanNext) {
+      // Capture the serialized history after context transforms, including MC.
+      // An empty set still consumes the explicit one-shot cleanup.
+      const ids = itemIds(payload.input);
+      const change: StateChange = { kind: "rejected", scope, ids };
+      pi.appendEntry(STATE_TYPE, change);
+      for (const id of ids) policy.ids.add(id);
+    }
 
     let cleaned = 0;
     const input = payload.input.map((item) => {
@@ -104,16 +123,17 @@ export default function azureCompat(pi: ExtensionAPI): void {
       stats.cleanedRequests++;
       stats.cleanedIds += cleaned;
     }
-    const ids = [...new Set(result.input.flatMap((item) => isRecord(item) && typeof item.id === "string" ? [item.id] : []))];
+    const ids = itemIds(result.input);
     snapshot = { scope, ids, provider: model.provider, api: model.api, model: model.id };
     return result;
   });
 
-  pi.on("agent_before_settle", (event, ctx) => {
+  pi.on("turn_end", (event, ctx) => {
+    inTurn = false;
     if (event.outcome !== "error" || event.continue || !snapshot || requestsInTurn !== 1
       || recoveriesInOperation >= 1 || snapshot.ids.length === 0 || ctx.signal?.aborted) return;
     if (!readPolicy(ctx, snapshot.scope).enabled || !ctx.model || scopeOf(ctx.model) !== snapshot.scope) return;
-    const contribution = event.context.contextEntries.findLast((entry) => entry.messages.some((message) => message.role === "assistant"));
+    const contribution = event.context.contextEntries.find((entry) => entry.sourceEntry.id === event.messageEntryId);
     const message = contribution?.messages.findLast((value) => value.role === "assistant");
     // HTTP JSON strings may contain literal escaped newlines; SSE may contain real ones.
     const error = String(message?.errorMessage ?? "").replace(/\\[nrt]/g, " ");
@@ -124,8 +144,11 @@ export default function azureCompat(pi: ExtensionAPI): void {
     const rejected: StateChange = { kind: "rejected", scope: snapshot.scope, ids: snapshot.ids };
     recoveriesInOperation++;
     stats.recoveries++;
+    pendingContinuationScope = snapshot.scope;
     snapshot = undefined;
     ctx.ui.notify(`Azure resource identity mismatch: retrying without ${rejected.ids.length} historical item IDs; encrypted reasoning is preserved.`, "warning");
+    // Commit before agent_end can queue a generic fallback. Error-branch turn_end
+    // continuation is ignored by Pi 1.4.0, so settlement supplies it only if needed.
     return {
       entries: [
         { type: "custom", customType: STATE_TYPE, data: rejected },
@@ -135,9 +158,18 @@ export default function azureCompat(pi: ExtensionAPI): void {
     };
   });
 
+  pi.on("agent_before_settle", (event, ctx) => {
+    if (!pendingContinuationScope || event.outcome !== "error" || event.continue
+      || ctx.signal?.aborted || !event.context.canContinue) return;
+    if (!readPolicy(ctx, pendingContinuationScope).enabled || !ctx.model
+      || scopeOf(ctx.model) !== pendingContinuationScope) return;
+    pendingContinuationScope = undefined;
+    return { continue: true };
+  });
+
   pi.registerCommand("azure-compat", {
-    description: "Azure resource identity recovery: status | on | off | reset",
-    getArgumentCompletions: (prefix) => ["status", "on", "off", "reset"]
+    description: "Responses history: status | clean | on | off | reset",
+    getArgumentCompletions: (prefix) => ["status", "clean", "on", "off", "reset"]
       .filter((value) => value.startsWith(prefix)).map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       const action = args.trim().toLowerCase() || "status";
@@ -146,17 +178,34 @@ export default function azureCompat(pi: ExtensionAPI): void {
         const change: StateChange = { kind: "mode", enabled: action === "on" };
         pi.appendEntry(STATE_TYPE, change);
         snapshot = undefined;
+        pendingContinuationScope = undefined;
       } else if (action === "reset") {
         if (!scope) { ctx.ui.notify("Select a model before resetting Azure compatibility state.", "warning"); return; }
         const change: StateChange = { kind: "reset", scope };
         pi.appendEntry(STATE_TYPE, change);
         snapshot = undefined;
+        pendingContinuationScope = undefined;
+      } else if (action === "clean") {
+        if (!ctx.model || !RESPONSES_APIS.has(ctx.model.api) || !scope) {
+          ctx.ui.notify("Select a Responses model before cleaning historical item IDs.", "warning");
+          return;
+        }
+        if (!readPolicy(ctx, scope).enabled) {
+          const mode: StateChange = { kind: "mode", enabled: true };
+          pi.appendEntry(STATE_TYPE, mode);
+        }
+        const change: StateChange = { kind: "clean-next", scope };
+        pi.appendEntry(STATE_TYPE, change);
+        snapshot = undefined;
+        pendingContinuationScope = undefined;
+        ctx.ui.notify("Historical item-ID cleanup is ready; compatibility is on. Re-submit your prompt: the next eligible request will remove history item IDs while preserving encrypted reasoning and call_id. Later fresh IDs are kept.", "info");
+        return;
       } else if (action !== "status") {
-        ctx.ui.notify("Usage: /azure-compat [status|on|off|reset]", "warning");
+        ctx.ui.notify("Usage: /azure-compat [status|clean|on|off|reset]", "warning");
         return;
       }
       const policy = readPolicy(ctx, scope);
-      ctx.ui.notify(`pi-azure-compat: ${policy.enabled ? "on" : "off"}; ${policy.ids.size} rejected IDs for the selected model. Runtime: ${stats.requests} eligible requests, ${stats.cleanedRequests} cleaned, ${stats.cleanedIds} IDs removed, ${stats.recoveries} recoveries.`, "info");
+      ctx.ui.notify(`pi-azure-compat: ${policy.enabled ? "on" : "off"}; ${policy.ids.size} suppressed item IDs for the selected model; manual cleanup ${policy.cleanNext ? "pending" : "idle"}. Runtime: ${stats.requests} eligible requests, ${stats.cleanedRequests} cleaned, ${stats.cleanedIds} IDs removed, ${stats.recoveries} recoveries.`, "info");
     },
   });
 }

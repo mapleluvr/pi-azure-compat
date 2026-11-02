@@ -38,8 +38,8 @@ globalThis.fetch = async (input, init) => {
 const ENC = "isolated-magic-context-ciphertext";
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
-async function fixture(order) {
-  const dir = join(root, order);
+async function fixture(order, fallback, manual = false) {
+  const dir = join(root, `${order}${fallback ? "-queued" : ""}${manual ? "-manual" : ""}`);
   await mkdir(dir, { recursive: true });
   const requests = [], errors = [], tools = new Map(), commands = new Map(), contextPasses = [], shutDown = [];
   let session, lastContext;
@@ -49,7 +49,7 @@ async function fixture(order) {
     requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
     if (requests.length === 1) {
       res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "The requested item was created under a\n different Azure OpenAI resource." } }));
+      res.end(JSON.stringify({ error: { type: "invalid_request_error", message: `The requested item was created under a\n different ${manual ? "***" : "Azure"} OpenAI resource.` } }));
       return;
     }
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -78,7 +78,16 @@ async function fixture(order) {
       return Reflect.get(target, property);
     } }));
     const monitor = (pi) => {
-      pi.on("context", (event, ctx) => { lastContext = ctx; contextPasses.push(event.messages.length); });
+      pi.on("context", (event, ctx) => {
+        lastContext = ctx;
+        contextPasses.push(event.messages.length);
+        if (fallback) return { messages: event.messages.filter((m) => !(m.role === "custom" && m.customType === "__retry_trigger")) };
+      });
+      if (fallback) pi.on("agent_end", (event) => {
+        if (requests.length === 1 && event.messages.findLast((m) => m.role === "assistant")?.stopReason === "error") {
+          pi.sendMessage({ customType: "__retry_trigger", content: "Retrying.", display: false }, { triggerTurn: true });
+        }
+      });
     };
     const factories = order === "magic-first" ? [observedMagic, repair, monitor] : [repair, observedMagic, monitor];
     const loader = new sdk.DefaultResourceLoader({ cwd: dir, agentDir: join(root, "agent"), settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt: "Isolated compatibility test.", extensionFactories: factories });
@@ -95,14 +104,22 @@ async function fixture(order) {
     ({ session } = await sdk.createAgentSession({ cwd: dir, agentDir: join(root, "agent"), modelRuntime: runtime, model: runtime.getModel("MagicReplayFixture", "gpt-joint-fixture"), settingsManager: settings, resourceLoader: loader, sessionManager: manager, tools: [] }));
     await session.bindExtensions({ onError: (e) => errors.push(e) });
     await session.prompt("Continue the historical question.");
+    if (manual) {
+      assert.equal(requests.length, 1);
+      await session.prompt("/azure-compat clean");
+      assert.equal(requests.length, 1, "manual cleanup must not make an extra request");
+      await session.prompt("Continue the historical question.");
+    }
     assert.equal(requests.length, 2, JSON.stringify({ errors, contextPasses, unexpectedNetwork, failures: session.messages.filter((m) => m.stopReason === "error" || m.stopReason === "aborted").map((m) => ({ stopReason: m.stopReason, errorMessage: m.errorMessage })) }));
     assert.equal(requests[0].input.find((x) => x.type === "reasoning")?.id, "rs_joint");
     assert.equal(requests[1].input.find((x) => x.type === "reasoning")?.encrypted_content, ENC);
     assert.equal(requests[1].input.some((x) => typeof x.id === "string"), false);
     assert.equal(requests[1].input.find((x) => x.type === "function_call")?.call_id, "call_joint");
     assert.equal(requests[1].input.find((x) => x.type === "function_call_output")?.call_id, "call_joint");
-    assert.deepEqual(requests[1].input.filter((x) => x.role === "user"), requests[0].input.filter((x) => x.role === "user"));
-    assert.equal(manager.getBranch().filter((e) => e.type === "context_edit").length, 1);
+    const previousUsers = requests[0].input.filter((x) => x.role === "user");
+    const retryUsers = requests[1].input.filter((x) => x.role === "user");
+    assert.deepEqual(manual ? retryUsers.slice(0, previousUsers.length) : retryUsers, previousUsers);
+    assert.equal(manager.getBranch().filter((e) => e.type === "context_edit").length, manual ? 0 : 1);
     assert.equal(manager.getBranch().filter((e) => e.type === "message" && e.message.stopReason === "error").length, 1);
     assert.ok(tools.has("ctx_reduce"), "real MC tools must be registered");
     const toolOutput = requests[1].input.find((x) => x.type === "function_call_output")?.output;
@@ -125,7 +142,7 @@ async function fixture(order) {
     assert.equal(requests[3].input.some((x) => x.id === "rs_joint" || x.id === "msg_joint" || x.id === "fc_joint"), false);
     assert.deepEqual(errors, []);
     assert.deepEqual(unexpectedNetwork, []);
-    return { version, order, requests: requests.length, contextPasses, extensionErrors: errors.length };
+    return { version, order, fallback, manual, requests: requests.length, contextPasses, extensionErrors: errors.length };
   } finally {
     if (lastContext) for (const handler of shutDown) await handler({ type: "session_shutdown" }, lastContext);
     session?.dispose();
@@ -134,9 +151,21 @@ async function fixture(order) {
   }
 }
 
-for (const order of ["magic-first", "repair-first"]) test(`installed Magic Context ${version} + repair (${order})`, { timeout: 60000 }, async () => {
-  console.log(JSON.stringify(await fixture(order)));
-});
+// Break caught: MC projection must still preserve ciphertext and tool pairing
+// when an agent_end fallback, rather than standalone settlement, starts the retry.
+for (const order of ["magic-first", "repair-first"]) for (const fallback of [false, true]) {
+  test(`installed Magic Context ${version} + repair (${order}, ${fallback ? "queued fallback" : "standalone"})`, { timeout: 60000 }, async () => {
+    console.log(JSON.stringify(await fixture(order, fallback)));
+  });
+}
+
+// Break caught: manual cleanup must capture the IDs after real MC projection,
+// preserve its tags/reductions and leave future response IDs intact.
+for (const order of ["magic-first", "repair-first"]) {
+  test(`installed Magic Context ${version} + manual clean (${order})`, { timeout: 60000 }, async () => {
+    console.log(JSON.stringify(await fixture(order, false, true)));
+  });
+}
 
 test.after(async () => {
   globalThis.fetch = originalFetch;

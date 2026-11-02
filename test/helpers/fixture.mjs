@@ -11,6 +11,12 @@ export const ENC = "opaque-encrypted-history-keep-byte-for-byte";
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
 export function respond(res, behavior) {
+  if (behavior === "router-resource" || behavior === "masked-resource") {
+    const message = behavior === "masked-resource" ? RESOURCE_ERROR.replace("Azure", "***") : RESOURCE_ERROR;
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ message: `OpenAI Responses bad request: ${message} Use the same resource that created the item to access it. [trace_id=loopback]`, type: "invalid_request_error", param: "", code: null }));
+    return;
+  }
   if (["resource", "enc", "tool-output", "ordinary-id-error"].includes(behavior)) {
     const message = { resource: RESOURCE_ERROR, enc: "The encrypted content could not be verified", "tool-output": "A tool call is missing its matching output", "ordinary-id-error": "Item with id rs_unknown was not found" }[behavior];
     res.writeHead(400, { "content-type": "application/json" });
