@@ -26,6 +26,15 @@ test("disk resume restores rejected IDs", async () => {
   assert.deepEqual(r.extensionErrors, []);
 });
 
+// Break caught: a redacted match preparing state that does not survive disk resume.
+test("disk resume restores rejected IDs from a masked resource error", async () => {
+  const r = await runFixture(["masked-resource", "ok", "ok"], { prompts: 2, diskResume: true, restartAfterFirst: true });
+  assert.equal(r.requests.length, 3);
+  assert.equal(r.requests[2].input.some((x) => x.id === "rs_history"), false);
+  assert.equal(r.requests[2].input.some((x) => x.id === "msg_fresh"), true);
+  assert.deepEqual(r.extensionErrors, []);
+});
+
 // Break caught: reload silently re-enabling a persisted off branch.
 test("off survives disk resume, then on permits a recovery", async () => {
   const r = await runFixture(["resource", "resource", "resource", "ok"], {
@@ -96,6 +105,12 @@ test("cleanup replaces wire items without mutating the payload supplied by earli
 test("ordinary item-not-found errors are not reclassified as the Azure resource error", async () => {
   const r = await runFixture(["ordinary-id-error", "ok"]);
   assert.equal(r.requests.length, 1);
+});
+
+test("resource-group wording is not reclassified as an item identity error", { timeout: 20000 }, async () => {
+  const r = await runFixture(["resource-group-error", "ok"], { captureNotifications: true });
+  assert.equal(r.requests.length, 1);
+  assert.equal(r.notifications.some((n) => n.type === "warning" && n.message.includes("/azure-compat clean")), false);
 });
 
 test("a payload for another model is left alone", async () => {

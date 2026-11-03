@@ -20,6 +20,48 @@ test("cross-resource: retry once with IDs removed, ciphertext and call linkage i
   assert.equal(rawHistory.message.content.find((block) => block.type === "toolCall").id, "call_history|fc_history");
 });
 
+// Break caught: a gateway that redacts the provider name defeating the exact Azure matcher.
+for (const behavior of ["masked-resource", "router-masked-resource"]) test(`redacted resource error: ${behavior} retries once with IDs removed`, { timeout: 20000 }, async () => {
+  const r = await runFixture([behavior, "ok"], { captureNotifications: true });
+  assert.equal(r.requests.length, 2, JSON.stringify({ errors: r.messages.filter((m) => m.stopReason === "error").map((m) => m.errorMessage), extensionErrors: r.extensionErrors }));
+  assert.equal(r.requests[0].input.filter((x) => typeof x.id === "string").length, 3);
+  assert.equal(r.requests[1].input.filter((x) => typeof x.id === "string").length, 0);
+  assert.equal(r.requests[1].input.find((x) => x.type === "reasoning").encrypted_content, ENC);
+  assert.equal(r.requests[1].input.find((x) => x.type === "function_call").call_id, "call_history");
+  assert.equal(r.lastText, "fixture-ok");
+  assert.equal(r.entries.filter((e) => e.type === "context_edit").length, 1);
+  const rejected = r.entries.filter((e) => e.type === "custom" && e.customType === "pi-azure-compat:state:v1" && e.data.kind === "rejected");
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].data.ids.length, 3);
+  const warning = r.notifications.find((n) => n.type === "warning" && n.message.includes("identity mismatch"));
+  assert.ok(warning, JSON.stringify(r.notifications));
+  assert.match(warning.message, /\(redacted\)/);
+  assert.deepEqual(r.extensionErrors, []);
+});
+
+test("status reports the last error classification", { timeout: 20000 }, async () => {
+  const r = await runFixture(["router-masked-resource", "ok"], {
+    prompts: 2,
+    captureNotifications: true,
+    beforePrompt: async ({ session }, i) => { if (i === 1) await session.prompt("/azure-compat status"); },
+  });
+  const status = r.notifications.findLast((n) => n.type === "info" && n.message.startsWith("pi-azure-compat:"));
+  assert.ok(status, JSON.stringify(r.notifications));
+  assert.match(status.message, /Last error: redacted \(prepared\)/);
+});
+
+test("status reports a weak error without changing the request", { timeout: 20000 }, async () => {
+  const r = await runFixture(["weak-resource", "ok"], {
+    prompts: 2,
+    captureNotifications: true,
+    beforePrompt: async ({ session }, i) => { if (i === 1) await session.prompt("/azure-compat status"); },
+  });
+  assert.equal(r.requests.length, 2);
+  const status = r.notifications.findLast((n) => n.type === "info" && n.message.startsWith("pi-azure-compat:"));
+  assert.ok(status, JSON.stringify(r.notifications));
+  assert.match(status.message, /Last error: weak \(unmatched\)/);
+});
+
 // Break caught: invisible retry markers still entering model context.
 test("retry adds no custom_message/user marker and preserves the failed raw entry", { timeout: 20000 }, async () => {
   const r = await runFixture(["resource", "ok"]);

@@ -1,6 +1,6 @@
 {
   "name": "pi-azure-compat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Recover Pi Responses requests from Azure resource identity errors while preserving encrypted reasoning.",
   "type": "module",
   "license": "MIT",

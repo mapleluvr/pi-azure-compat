@@ -11,14 +11,15 @@ export const ENC = "opaque-encrypted-history-keep-byte-for-byte";
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
 export function respond(res, behavior) {
-  if (behavior === "router-resource" || behavior === "masked-resource") {
-    const message = behavior === "masked-resource" ? RESOURCE_ERROR.replace("Azure", "***") : RESOURCE_ERROR;
+  if (behavior === "router-resource" || behavior === "masked-resource" || behavior === "router-masked-resource") {
+    const base = behavior === "router-resource" ? RESOURCE_ERROR : RESOURCE_ERROR.replace("Azure", "***");
+    const message = behavior === "router-masked-resource" ? base.replace(/\n\s+/, " ") : base;
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({ message: `OpenAI Responses bad request: ${message} Use the same resource that created the item to access it. [trace_id=loopback]`, type: "invalid_request_error", param: "", code: null }));
     return;
   }
-  if (["resource", "enc", "tool-output", "ordinary-id-error"].includes(behavior)) {
-    const message = { resource: RESOURCE_ERROR, enc: "The encrypted content could not be verified", "tool-output": "A tool call is missing its matching output", "ordinary-id-error": "Item with id rs_unknown was not found" }[behavior];
+  if (["resource", "weak-resource", "resource-group-error", "opaque-resource", "enc", "tool-output", "ordinary-id-error"].includes(behavior)) {
+    const message = { resource: RESOURCE_ERROR, "weak-resource": "The requested item was created under a different *** OpenAI resource.", "resource-group-error": "The requested item was created under a different resource group. Use the same resource that created the item to access it.", "opaque-resource": "The request could not be completed. [trace_id=loopback]", enc: "The encrypted content could not be verified", "tool-output": "A tool call is missing its matching output", "ordinary-id-error": "Item with id rs_unknown was not found" }[behavior];
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: { message, type: "invalid_request_error", code: null } }));
     return;
@@ -45,9 +46,9 @@ export function respond(res, behavior) {
   res.end();
 }
 
-export async function runFixture(behaviors, { prompts = 1, mutatePayload, afterTurn, abortAtEnd = false, restartAfterFirst = false, rollbackBeforeRepair = false, diskResume = false, beforePrompt, afterPrompt, precedingExtension, trailingExtension } = {}) {
+export async function runFixture(behaviors, { prompts = 1, mutatePayload, afterTurn, abortAtEnd = false, restartAfterFirst = false, rollbackBeforeRepair = false, diskResume = false, beforePrompt, afterPrompt, precedingExtension, trailingExtension, captureNotifications = false } = {}) {
   const dir = await mkdtemp(join(tmpdir(), "pi-azure-compat-"));
-  const requests = [], events = [], extensionErrors = [];
+  const requests = [], events = [], extensionErrors = [], notifications = [];
   let session, manager;
   const server = createServer(async (req, res) => {
     const chunks = [];
@@ -89,6 +90,16 @@ export async function runFixture(behaviors, { prompts = 1, mutatePayload, afterT
       ({ session } = await createAgentSession({ cwd: dir, agentDir: dir, modelRuntime, model: modelRuntime.getModel("ReplayFixture", "gpt-replay-fixture"), thinkingLevel: "low", settingsManager, resourceLoader, sessionManager: manager, tools: [] }));
       session.subscribe((event) => events.push(event.type));
       await session.bindExtensions({ onError: (error) => extensionErrors.push(error) });
+      if (captureNotifications) {
+        const baseUI = session.extensionRunner.getUIContext();
+        session.extensionRunner.setUIContext({
+          ...baseUI,
+          notify: (message, type) => {
+            notifications.push({ message, type });
+            baseUI.notify(message, type);
+          },
+        }, session.extensionRunner.mode);
+      }
     }
     await createSession();
     for (let i = 0; i < prompts; i++) {
@@ -107,7 +118,7 @@ export async function runFixture(behaviors, { prompts = 1, mutatePayload, afterT
       await session.prompt(`question-${i}`);
       await afterPrompt?.(fixture, i);
     }
-    return { requests, events, extensionErrors, entries: manager.getBranch(), lastText: session.getLastAssistantText(), messages: session.messages };
+    return { requests, events, extensionErrors, notifications, entries: manager.getBranch(), lastText: session.getLastAssistantText(), messages: session.messages };
   } finally {
     session?.dispose();
     server.closeAllConnections();

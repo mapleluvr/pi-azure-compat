@@ -22,7 +22,7 @@ function queuedFallback(maxRetries) {
 // Break caught: waiting until settlement to register rejected IDs starves the repair
 // while the generic agent_end fallback keeps queuing unmodified requests.
 for (const order of ["retry-first", "repair-first"]) {
-  for (const error of ["resource", "router-resource"]) {
+  for (const error of ["resource", "router-resource", "masked-resource"]) {
     test(`queued fallback sends its first retry ID-free (${order}, ${error})`, async () => {
       const r = await runFixture([error, "ok"], {
         [order === "retry-first" ? "precedingExtension" : "trailingExtension"]: queuedFallback(1000),
@@ -40,6 +40,21 @@ for (const order of ["retry-first", "repair-first"]) {
     });
   }
 }
+
+// Break caught: an unrecognized item/resource wording disabling recovery or
+// repeating a hint on every queued retry.
+test("weak resource wording hints once and leaves IDs untouched across queued retries", async () => {
+  const r = await runFixture(["weak-resource", "weak-resource", "weak-resource", "ok"], {
+    precedingExtension: queuedFallback(5),
+    captureNotifications: true,
+  });
+  assert.equal(r.requests.length, 4);
+  assert.equal(r.requests[1].input.some((x) => x.id === "rs_history"), true);
+  const hints = r.notifications.filter((n) => n.type === "warning" && n.message.includes("/azure-compat clean"));
+  assert.equal(hints.length, 1, JSON.stringify(r.notifications));
+  assert.equal(rejectedEntries(r).length, 0);
+  assert.deepEqual(r.extensionErrors, []);
+});
 
 // Break caught: a failed already-cleaned retry causing a second identity repair
 // or an extra settlement request after the generic fallback budget ends.

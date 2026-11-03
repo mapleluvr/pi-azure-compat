@@ -2,8 +2,24 @@ import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const STATE_TYPE = "pi-azure-compat:state:v1";
-const RESOURCE_ERROR = /The\s+requested\s+item\s+was\s+created\s+under\s+a\s+different\s+Azure\s+OpenAI\s+resource\b/i;
+const STRICT_RESOURCE_ERROR = /The\s+requested\s+item\s+was\s+created\s+under\s+a\s+different\s+Azure\s+OpenAI\s+resource\b/i;
+const ITEM_IDENTITY_CLAUSE = /The\s+requested\s+item\s+was\s+created\s+under\s+a\s+different\b[^.]{0,120}?\bresource\b(?!\s+(?:group|quota|limit|provider)\b)/i;
+const SAME_RESOURCE_HINT = /same\s+resource\s+that\s+created\s+the\s+item\b/i;
 const RESPONSES_APIS = new Set(["openai-responses", "azure-openai-responses"]);
+type ResourceErrorMatch = "strict" | "redacted" | "weak" | "none";
+type SkipReason =
+  | "continued"
+  | "no-snapshot"
+  | "multi-request"
+  | "aborted"
+  | "disabled"
+  | "scope"
+  | "message"
+  | "provider"
+  | "unmatched"
+  | "budget"
+  | "no-ids"
+  | "prepared";
 type SelectedModel = NonNullable<ExtensionContext["model"]>;
 type WirePayload = Record<string, unknown> & { model: string; input: unknown[] };
 type StateChange =
@@ -59,6 +75,21 @@ function itemIds(input: unknown[]): string[] {
   return [...new Set(input.flatMap((item) => isRecord(item) && typeof item.id === "string" ? [item.id] : []))];
 }
 
+function normalizeErrorText(value: unknown): string {
+  // HTTP JSON strings may contain literal escaped newlines; SSE may contain real ones.
+  return String(value ?? "")
+    .replace(/\\[nrt]/g, " ")
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function classifyResourceError(text: string): ResourceErrorMatch {
+  if (STRICT_RESOURCE_ERROR.test(text)) return "strict";
+  if (!ITEM_IDENTITY_CLAUSE.test(text)) return "none";
+  return SAME_RESOURCE_HINT.test(text) ? "redacted" : "weak";
+}
+
 /** Recover narrow Azure identity errors and support explicit history-ID cleanup. */
 export default function azureCompat(pi: ExtensionAPI): void {
   let snapshot: Snapshot | undefined;
@@ -66,6 +97,9 @@ export default function azureCompat(pi: ExtensionAPI): void {
   let inTurn = false;
   let requestsInTurn = 0;
   let recoveriesInOperation = 0;
+  let weakHinted = false;
+  let lastMatch: ResourceErrorMatch = "none";
+  let lastSkip: SkipReason | undefined;
   const stats = { requests: 0, cleanedRequests: 0, cleanedIds: 0, recoveries: 0 };
 
   function clearOperation(): void {
@@ -74,9 +108,12 @@ export default function azureCompat(pi: ExtensionAPI): void {
     inTurn = false;
     requestsInTurn = 0;
     recoveriesInOperation = 0;
+    weakHinted = false;
   }
   pi.on("session_start", () => {
     clearOperation();
+    lastMatch = "none";
+    lastSkip = undefined;
     Object.assign(stats, { requests: 0, cleanedRequests: 0, cleanedIds: 0, recoveries: 0 });
   });
   pi.on("session_shutdown", clearOperation);
@@ -130,23 +167,45 @@ export default function azureCompat(pi: ExtensionAPI): void {
 
   pi.on("turn_end", (event, ctx) => {
     inTurn = false;
-    if (event.outcome !== "error" || event.continue || !snapshot || requestsInTurn !== 1
-      || recoveriesInOperation >= 1 || snapshot.ids.length === 0 || ctx.signal?.aborted) return;
-    if (!readPolicy(ctx, snapshot.scope).enabled || !ctx.model || scopeOf(ctx.model) !== snapshot.scope) return;
+    if (event.outcome !== "error") return;
+    lastMatch = "none";
+    lastSkip = "message";
+    if (event.continue) { lastSkip = "continued"; return; }
+    if (!snapshot) { lastSkip = "no-snapshot"; return; }
+    if (requestsInTurn !== 1) { lastSkip = "multi-request"; return; }
+    if (ctx.signal?.aborted) { lastSkip = "aborted"; return; }
+    const policy = readPolicy(ctx, snapshot.scope);
+    if (!policy.enabled) { lastSkip = "disabled"; return; }
+    if (!ctx.model || scopeOf(ctx.model) !== snapshot.scope) { lastSkip = "scope"; return; }
     const contribution = event.context.contextEntries.find((entry) => entry.sourceEntry.id === event.messageEntryId);
     const message = contribution?.messages.findLast((value) => value.role === "assistant");
-    // HTTP JSON strings may contain literal escaped newlines; SSE may contain real ones.
-    const error = String(message?.errorMessage ?? "").replace(/\\[nrt]/g, " ");
-    if (!message || message.stopReason !== "error" || !RESOURCE_ERROR.test(error)) return;
-    if (message.provider !== snapshot.provider || message.api !== snapshot.api || message.model !== snapshot.model) return;
-    if (message.content.length !== 0 || contribution?.sourceEntry.type !== "message") return;
+    if (!message) { lastSkip = "message"; return; }
+    lastMatch = classifyResourceError(normalizeErrorText(message.errorMessage));
+    if (message.stopReason !== "error" || message.content.length !== 0
+      || contribution?.sourceEntry.type !== "message") { lastSkip = "message"; return; }
+    if (message.provider !== snapshot.provider || message.api !== snapshot.api || message.model !== snapshot.model) {
+      lastSkip = "provider";
+      return;
+    }
+    if (snapshot.ids.length === 0) { lastSkip = "no-ids"; return; }
+    if (lastMatch === "weak") {
+      lastSkip = "unmatched";
+      if (!weakHinted) {
+        weakHinted = true;
+        ctx.ui.notify("Unrecognized item/resource identity error; if this is the Azure cross-resource error, run /azure-compat clean and resubmit. No request was changed.", "warning");
+      }
+      return;
+    }
+    if (lastMatch === "none") { lastSkip = "unmatched"; return; }
+    if (recoveriesInOperation >= 1) { lastSkip = "budget"; return; }
 
     const rejected: StateChange = { kind: "rejected", scope: snapshot.scope, ids: snapshot.ids };
     recoveriesInOperation++;
     stats.recoveries++;
     pendingContinuationScope = snapshot.scope;
     snapshot = undefined;
-    ctx.ui.notify(`Azure resource identity mismatch: retrying without ${rejected.ids.length} historical item IDs; encrypted reasoning is preserved.`, "warning");
+    lastSkip = "prepared";
+    ctx.ui.notify(`Azure resource identity mismatch (${lastMatch}): retrying without ${rejected.ids.length} historical item IDs; encrypted reasoning is preserved.`, "warning");
     // Commit before agent_end can queue a generic fallback. Error-branch turn_end
     // continuation is ignored by Pi 1.4.0, so settlement supplies it only if needed.
     return {
@@ -205,7 +264,8 @@ export default function azureCompat(pi: ExtensionAPI): void {
         return;
       }
       const policy = readPolicy(ctx, scope);
-      ctx.ui.notify(`pi-azure-compat: ${policy.enabled ? "on" : "off"}; ${policy.ids.size} suppressed item IDs for the selected model; manual cleanup ${policy.cleanNext ? "pending" : "idle"}. Runtime: ${stats.requests} eligible requests, ${stats.cleanedRequests} cleaned, ${stats.cleanedIds} IDs removed, ${stats.recoveries} recoveries.`, "info");
+      const lastError = lastMatch === "none" && !lastSkip ? "none" : `${lastMatch} (${lastSkip ?? "unclassified"})`;
+      ctx.ui.notify(`pi-azure-compat: ${policy.enabled ? "on" : "off"}; ${policy.ids.size} suppressed item IDs for the selected model; manual cleanup ${policy.cleanNext ? "pending" : "idle"}. Runtime: ${stats.requests} eligible requests, ${stats.cleanedRequests} cleaned, ${stats.cleanedIds} IDs removed, ${stats.recoveries} recoveries. Last error: ${lastError}.`, "info");
     },
   });
 }

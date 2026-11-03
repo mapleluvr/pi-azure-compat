@@ -34,12 +34,12 @@ test("clean strips current history once, preserves payload contents and later fr
 
 // Break caught: clean must survive reload while pending, and keep the captured
 // history IDs suppressed after use, even for errors outside the auto matcher.
-test("manual clean after a masked resource error survives disk resume", async () => {
-  const r = await runFixture(["masked-resource", "ok", "ok"], {
+test("manual clean after an unrecognized resource error survives disk resume", async () => {
+  const r = await runFixture(["opaque-resource", "ok", "ok"], {
     prompts: 3, diskResume: true, restartAfterFirst: true,
     afterPrompt: async ({ session, requests }, i) => {
       if (i === 0) {
-        assert.equal(requests.length, 1, "masked resource wording stays outside auto recovery");
+        assert.equal(requests.length, 1, "unrecognized wording stays outside auto recovery");
         await session.prompt("/azure-compat clean");
         assert.equal(requests.length, 1);
       }

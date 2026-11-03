@@ -38,8 +38,8 @@ globalThis.fetch = async (input, init) => {
 const ENC = "isolated-magic-context-ciphertext";
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
-async function fixture(order, fallback, manual = false) {
-  const dir = join(root, `${order}${fallback ? "-queued" : ""}${manual ? "-manual" : ""}`);
+async function fixture(order, fallback, manual = false, redacted = false) {
+  const dir = join(root, `${order}${fallback ? "-queued" : ""}${manual ? "-manual" : ""}${redacted ? "-redacted" : ""}`);
   await mkdir(dir, { recursive: true });
   const requests = [], errors = [], tools = new Map(), commands = new Map(), contextPasses = [], shutDown = [];
   let session, lastContext;
@@ -49,7 +49,9 @@ async function fixture(order, fallback, manual = false) {
     requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
     if (requests.length === 1) {
       res.writeHead(400, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: { type: "invalid_request_error", message: `The requested item was created under a\n different ${manual ? "***" : "Azure"} OpenAI resource.` } }));
+      const providerName = manual || redacted ? "***" : "Azure";
+      const resourceHint = redacted ? " Use the same resource that created the item to access it." : "";
+      res.end(JSON.stringify({ error: { type: "invalid_request_error", message: `The requested item was created under a\n different ${providerName} OpenAI resource.${resourceHint}` } }));
       return;
     }
     res.writeHead(200, { "content-type": "text/event-stream" });
@@ -156,6 +158,14 @@ async function fixture(order, fallback, manual = false) {
 for (const order of ["magic-first", "repair-first"]) for (const fallback of [false, true]) {
   test(`installed Magic Context ${version} + repair (${order}, ${fallback ? "queued fallback" : "standalone"})`, { timeout: 60000 }, async () => {
     console.log(JSON.stringify(await fixture(order, fallback)));
+  });
+}
+
+// Break caught: MC projection plus a provider that redacts the provider name
+// must still prepare and reuse the same historical-ID repair.
+for (const order of ["magic-first", "repair-first"]) {
+  test(`installed Magic Context ${version} + redacted repair (${order})`, { timeout: 60000 }, async () => {
+    console.log(JSON.stringify(await fixture(order, false, false, true)));
   });
 }
 
