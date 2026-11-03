@@ -66,11 +66,14 @@ Last error: redacted (prepared).
 - 本机完整 `../pi-retry/index.ts`：普通/Fast-Retry × retry-first/repair-first × `router-resource`/`router-masked-resource`/`masked-resource`，共 12 个场景。每个场景 2 个请求，ID 数为 `[3, 0]`，密文保留，扩展错误 0。隔离日志记录 12 次 retry 和 12 次 retry_succeeded；源码 SHA-256 为 `ba8e7db9bd245f0fe65e6471d034af67f4c8cd7a05f1999f2c3e74c2176e353c`。
 - 对本地实际错误重新分类，结果为 `redacted`；该结果来自实际存盘的 298 字符错误文本，不是只测构造样例。
 - 主动 LSP 检查对源码返回 inconclusive，未把空 diagnostics 当作确认；类型结论来自实际 `tsc --noEmit`。Markdown 语言检查本次不可用，文档由人工核对，不称其为“Markdown 检查通过”。
+- 一次连续重复压测中出现 loopback `Connection error.`（TIME_WAIT 已累积到 1000+），同一用例单独与间隔后重跑均通过；该失败发生在本地服务器未收到请求前，未归因为匹配器或恢复逻辑。最终正式检查为 71/71。
 
 本地材料：`docs/.temp/red-redacted-recovery.txt`、`green-redacted-recovery.txt`、`green-retry-redacted.txt`、`full-retry-check.mjs`。
 
 ## 本机应用
 
-工作区版本为 `0.2.0`。本机 git 安装副本的同步与运行中会话的 `/reload` 由用户在目标环境完成；本记录不宣称远端发布或运行中会话已经更新。同步前应保留安装副本的旧入口备份，避免覆盖其本地状态。
+工作区版本为 `0.2.0`，提交 `7a07769`。本机 git 安装副本已通过 `git fetch` + `git merge --ff-only` 从 `ffaa2c7` 同步到同一提交，工作区干净；旧入口和 package.json 备份在 `docs/.temp/installed-index-before-redacted.ts` 与 `installed-package-before-redacted.json`。安装入口的 SHA-256 与工作区 `src/index.ts` 一致（`706E5739...`），版本为 `0.2.0`；安装副本的 package manifest 入口可被 Pi 加载。
 
-远端发布前还需要：提交工作区、按发布流程更新远端，并在安装副本上重跑同一组 MC/pi-retry 验证。
+用安装副本入口重跑完整 pi-retry 的 12 个场景，全部为 2 请求、`[3, 0]` ID、扩展错误 0，日志仍为 24 条事件。安装副本没有 `node_modules`，因此没有在该目录重复执行整个测试套件；完整套件与 MC 验证在工作区完成，入口字节一致。
+
+运行中的 Pi 会话需要用户执行 `/reload` 才会载入新实现；本记录不宣称任何已打开会话已经更新。远端 `origin` 尚未推送，提交 `7a07769` 只在本地与安装副本中。
