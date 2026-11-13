@@ -57,6 +57,6 @@
 
 ### 交付状态
 
-0.2.1 为本地开发改动。本轮未 push、未同步 Git 安装、未重载用户会话；已发布与安装入口仍为 0.2.0 / `99e351f`。当前安装不会因开发目录修改自动更新。发布时需要 push 远端再更新 Git 安装，而不是只 fast-forward 本机到未发布提交。
+实现提交为 `1c6b17f`。初次交付时是本地 0.2.1、安装仍为 0.2.0；随后用户要求安装并 push，已从远端发布并同步 Git 安装。过程与实际安装入口验证见 [0.2.1 发布记录](2026-11-13-0.2.1-release.md)。运行中的用户会话未被自动重载。
 
 可持续回归入口为 `test/recovery-budget.test.mjs`、`test/retry-interop.test.mjs` 与 `test/magic-context.test.mjs`。本机补充脚本与输出放在未跟踪的 `docs/.temp/`：`verify-failure-chain-full-retry.mjs`、`verify-failure-chain-reported-errors.mjs`、`current-sdk-hooks.mjs` 及 `green-failure-chain-*`；正式结论和边界已在本记录保留。
