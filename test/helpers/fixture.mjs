@@ -8,6 +8,7 @@ import extension from "../../src/index.ts";
 
 export const RESOURCE_ERROR = "The requested item was created under a\n different Azure OpenAI resource.";
 export const ENC = "opaque-encrypted-history-keep-byte-for-byte";
+export const TOOL_ENC = "opaque-encrypted-fresh-tool-reasoning";
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
 export function respond(res, behavior) {
@@ -34,6 +35,22 @@ export function respond(res, behavior) {
     emit({ type: "response.failed", response: { id: "resp_partial", status: "failed", error: { message: RESOURCE_ERROR, code: "invalid_request_error" } } });
   } else if (behavior === "sse-resource") {
     emit({ type: "response.failed", response: { id: "resp_failed", status: "failed", error: { message: RESOURCE_ERROR, code: "invalid_request_error" } } });
+  } else if (/^tool-\d+$/.test(behavior)) {
+    const serial = behavior.slice(5);
+    const reasoning = { type: "reasoning", id: `rs_tool_${serial}`, summary: [], encrypted_content: TOOL_ENC };
+    const message = { type: "message", id: `msg_tool_${serial}`, role: "assistant", phase: "commentary", status: "completed", content: [{ type: "output_text", text: "tool turn", annotations: [] }] };
+    const call = { type: "function_call", id: `fc_tool_${serial}`, call_id: `call_tool_${serial}`, name: "fixture_tool", arguments: "{}", status: "completed" };
+    emit({ type: "response.created", response: { id: `resp_tool_${serial}`, status: "in_progress" } });
+    emit({ type: "response.output_item.added", output_index: 0, item: reasoning });
+    emit({ type: "response.output_item.done", output_index: 0, item: reasoning });
+    emit({ type: "response.output_item.added", output_index: 1, item: { ...message, status: "in_progress", content: [] } });
+    emit({ type: "response.content_part.added", output_index: 1, content_index: 0, part: { type: "output_text", text: "", annotations: [] } });
+    emit({ type: "response.output_text.delta", output_index: 1, content_index: 0, delta: "tool turn" });
+    emit({ type: "response.output_item.done", output_index: 1, item: message });
+    emit({ type: "response.output_item.added", output_index: 2, item: { ...call, arguments: "", status: "in_progress" } });
+    emit({ type: "response.function_call_arguments.delta", output_index: 2, delta: "{}" });
+    emit({ type: "response.output_item.done", output_index: 2, item: call });
+    emit({ type: "response.completed", response: { id: `resp_tool_${serial}`, status: "completed", output: [reasoning, message, call], usage: { input_tokens: 20, output_tokens: 2, total_tokens: 22, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 1 } } } });
   } else {
     const item = { type: "message", id: "msg_fresh", role: "assistant", status: "completed", content: [{ type: "output_text", text: "fixture-ok", annotations: [] }] };
     emit({ type: "response.created", response: { id: "resp_ok", status: "in_progress" } });
@@ -44,6 +61,14 @@ export function respond(res, behavior) {
     emit({ type: "response.completed", response: { id: "resp_ok", status: "completed", output: [item], usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } } });
   }
   res.end();
+}
+
+export function registerFixtureTool(pi) {
+  pi.registerTool({
+    name: "fixture_tool", label: "Fixture tool", description: "Loopback test tool.",
+    parameters: { type: "object", properties: {}, additionalProperties: false },
+    execute: async () => ({ content: [{ type: "text", text: "fixture-tool-ok" }], details: {} }),
+  });
 }
 
 export async function runFixture(behaviors, { prompts = 1, mutatePayload, afterTurn, abortAtEnd = false, restartAfterFirst = false, rollbackBeforeRepair = false, diskResume = false, beforePrompt, afterPrompt, precedingExtension, trailingExtension, captureNotifications = false } = {}) {
@@ -66,6 +91,7 @@ export async function runFixture(behaviors, { prompts = 1, mutatePayload, afterT
     const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false, provider: { maxRetries: 0 } }, cacheWarming: "off" });
     const resourceLoader = new DefaultResourceLoader({ cwd: dir, agentDir: dir, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt: "Loopback compatibility test.", extensionFactories: [
       (pi) => {
+        registerFixtureTool(pi);
         if (mutatePayload) pi.on("before_provider_request", ({ payload }) => { mutatePayload(payload); });
         if (afterTurn) pi.on("turn_end", afterTurn);
         precedingExtension?.(pi);

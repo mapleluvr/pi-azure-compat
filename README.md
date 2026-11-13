@@ -13,7 +13,7 @@ The requested item was created under a different *** OpenAI resource. Use the sa
 
 ## 安装
 
-需要 **Pi ≥ 1.4.0**、Node.js ≥ 22.19.0。当前测试固定使用 Pi 1.4.0；其他版本以相应验证结果为准。
+需要 **Pi ≥ 1.4.0**、Node.js ≥ 22.19.0。开发测试固定使用 Pi 1.4.0，并对 Pi 1.5.2 做本机集成验证；具体组合见[连续失败链恢复记录](docs/changes/2026-11-13-failure-chain-recovery.md)。
 
 ```sh
 pi install git:github.com/mapleluvr/pi-azure-compat
@@ -46,7 +46,7 @@ turn_end 记录本次实际请求的历史 ID
 
 失败的原始 assistant entry 和 usage 仍在会话中，只通过 `context_edit` 省略它对后续模型上下文的贡献。恢复状态保存为不进入模型上下文的 custom entry；不会插入隐藏的 user 重试提示。
 
-受影响 ID 按 **provider + API + baseUrl + model** 隔离，随活动分支持久化，支持重载与磁盘 resume。scope 保存的是摘要而不是 URL。每次操作到最终 settlement 最多自动修复一次；继续失败时把错误交还调用方。
+受影响 ID 按 **provider + API + baseUrl + model** 隔离，随活动分支持久化，支持重载与磁盘 resume。scope 保存的是摘要而不是 URL。**每条连续失败链最多自动修复一次**；正常完成的主模型响应（包括工具调用响应）结束该失败链，刷新额度，但已记录的拒绝 ID 继续清理。同一长操作随后因新 ID 再次出错时，可以再修复；修复后仍连续失败，则停止本插件的自动补救。进入下一 turn、通用重试或部分输出后失败都不会刷新额度。
 
 ## 为什么清理全部 ID
 
@@ -96,7 +96,7 @@ turn_end 记录本次实际请求的历史 ID
 
 ## Magic Context
 
-实际 **Magic Context 0.49.13 + Pi 1.4.0** 联调覆盖两个加载顺序、独立续跑和通用重试排队、错误后的上下文重投影、后续新 ID 保留，以及真实 `ctx_reduce` / `/ctx-flush` 的物化删除。
+实际 **Magic Context 0.49.13 + Pi 1.4.0** 联调覆盖两个加载顺序、独立续跑和通用重试排队、成功工具响应后再次身份错误、错误后的上下文重投影、后续新 ID 保留，以及真实 `ctx_reduce` / `/ctx-flush` 的物化删除。本机另验证 **MC 0.49.50 + Pi 1.5.2**，推理保留配置为默认 10,000；该短历史场景不代表已经覆盖超出预算导致 rs 被省略的问题。
 
 MC 先管理上下文，插件再处理序列化请求中的 ID。保留的是 **MC 投影后仍存在的密文**；MC 自己按配置移除的推理不会由本插件塞回。联调关闭了 historian/dreamer/自动搜索，不能据此宣称所有后台并发均已验证。
 
@@ -114,6 +114,7 @@ npm run check
 - [当前行为规格](docs/state/behavior.md)
 - [设计来路与验证范围](docs/changes/2026-10-26-initial-release.md)
 - [脱敏 resource 错误自动恢复](docs/changes/2026-11-03-redacted-resource-recovery.md)
+- [连续失败链恢复额度与验证](docs/changes/2026-11-13-failure-chain-recovery.md)
 
 ## License
 

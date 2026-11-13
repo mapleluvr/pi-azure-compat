@@ -21,9 +21,10 @@ await writeFile(join(root, "config", "cortexkit", "magic-context.jsonc"), JSON.s
   enabled: true, historian: { disable: true }, dreamer: { disable: true },
   memory: { enabled: false, auto_search: { enabled: false } },
   smart_notes: { enabled: false }, todowrite: { enabled: false },
-  keep_reasoning_tokens: 1000000, protected_tokens: 0, protected_tags: 0,
+  keep_reasoning_tokens: Number(process.env.MC_KEEP_REASONING_TOKENS ?? 1000000), protected_tokens: 0, protected_tags: 0,
 }));
 const sdk = await import("@earendil-works/pi-coding-agent");
+const { respond, registerFixtureTool, TOOL_ENC } = await import("./helpers/fixture.mjs");
 const magicEntry = import.meta.resolve("@cortexkit/pi-magic-context");
 const { default: magic } = await import(magicEntry);
 const { version } = JSON.parse(await readFile(new URL("../package.json", magicEntry), "utf8"));
@@ -38,22 +39,27 @@ globalThis.fetch = async (input, init) => {
 const ENC = "isolated-magic-context-ciphertext";
 const usage = { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 
-async function fixture(order, fallback, manual = false, redacted = false) {
-  const dir = join(root, `${order}${fallback ? "-queued" : ""}${manual ? "-manual" : ""}${redacted ? "-redacted" : ""}`);
+async function fixture(order, fallback, manual = false, redacted = false, repeated = false) {
+  const dir = join(root, `${order}${fallback ? "-queued" : ""}${manual ? "-manual" : ""}${redacted ? "-redacted" : ""}${repeated ? "-repeated" : ""}`);
   await mkdir(dir, { recursive: true });
   const requests = [], errors = [], tools = new Map(), commands = new Map(), contextPasses = [], shutDown = [];
   let session, lastContext;
+  const failedRequestCounts = new Set(repeated ? [1, 3] : [1]);
+  const responseCount = repeated ? 4 : 2;
+  const failureCount = failedRequestCounts.size;
+  const expectedRepairs = manual ? 0 : failureCount;
   const server = createServer(async (req, res) => {
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     requests.push(JSON.parse(Buffer.concat(chunks).toString("utf8")));
-    if (requests.length === 1) {
+    if (failedRequestCounts.has(requests.length)) {
       res.writeHead(400, { "content-type": "application/json" });
       const providerName = manual || redacted ? "***" : "Azure";
       const resourceHint = redacted ? " Use the same resource that created the item to access it." : "";
       res.end(JSON.stringify({ error: { type: "invalid_request_error", message: `The requested item was created under a\n different ${providerName} OpenAI resource.${resourceHint}` } }));
       return;
     }
+    if (repeated && requests.length === 2) { respond(res, "tool-1"); return; }
     res.writeHead(200, { "content-type": "text/event-stream" });
     const emit = (e) => res.write(`data: ${JSON.stringify(e)}\n\n`);
     const item = { type: "message", id: `msg_fresh_${requests.length}`, role: "assistant", status: "completed", content: [{ type: "output_text", text: "joint-fixture-ok", annotations: [] }] };
@@ -80,13 +86,14 @@ async function fixture(order, fallback, manual = false, redacted = false) {
       return Reflect.get(target, property);
     } }));
     const monitor = (pi) => {
+      if (repeated) registerFixtureTool(pi);
       pi.on("context", (event, ctx) => {
         lastContext = ctx;
         contextPasses.push(event.messages.length);
         if (fallback) return { messages: event.messages.filter((m) => !(m.role === "custom" && m.customType === "__retry_trigger")) };
       });
       if (fallback) pi.on("agent_end", (event) => {
-        if (requests.length === 1 && event.messages.findLast((m) => m.role === "assistant")?.stopReason === "error") {
+        if (failedRequestCounts.has(requests.length) && event.messages.findLast((m) => m.role === "assistant")?.stopReason === "error") {
           pi.sendMessage({ customType: "__retry_trigger", content: "Retrying.", display: false }, { triggerTurn: true });
         }
       });
@@ -112,7 +119,7 @@ async function fixture(order, fallback, manual = false, redacted = false) {
       assert.equal(requests.length, 1, "manual cleanup must not make an extra request");
       await session.prompt("Continue the historical question.");
     }
-    assert.equal(requests.length, 2, JSON.stringify({ errors, contextPasses, unexpectedNetwork, failures: session.messages.filter((m) => m.stopReason === "error" || m.stopReason === "aborted").map((m) => ({ stopReason: m.stopReason, errorMessage: m.errorMessage })) }));
+    assert.equal(requests.length, responseCount, JSON.stringify({ errors, contextPasses, unexpectedNetwork, failures: session.messages.filter((m) => m.stopReason === "error" || m.stopReason === "aborted").map((m) => ({ stopReason: m.stopReason, errorMessage: m.errorMessage })) }));
     assert.equal(requests[0].input.find((x) => x.type === "reasoning")?.id, "rs_joint");
     assert.equal(requests[1].input.find((x) => x.type === "reasoning")?.encrypted_content, ENC);
     assert.equal(requests[1].input.some((x) => typeof x.id === "string"), false);
@@ -121,15 +128,21 @@ async function fixture(order, fallback, manual = false, redacted = false) {
     const previousUsers = requests[0].input.filter((x) => x.role === "user");
     const retryUsers = requests[1].input.filter((x) => x.role === "user");
     assert.deepEqual(manual ? retryUsers.slice(0, previousUsers.length) : retryUsers, previousUsers);
-    assert.equal(manager.getBranch().filter((e) => e.type === "context_edit").length, manual ? 0 : 1);
-    assert.equal(manager.getBranch().filter((e) => e.type === "message" && e.message.stopReason === "error").length, 1);
+    assert.equal(manager.getBranch().filter((e) => e.type === "context_edit").length, expectedRepairs);
+    assert.equal(manager.getBranch().filter((e) => e.type === "message" && e.message.stopReason === "error").length, failureCount);
+    if (repeated) {
+      assert.deepEqual(requests.slice(0, 4).map((p) => p.input.filter((x) => typeof x.id === "string").length), [3, 0, 3, 0]);
+      assert.equal(requests[3].input.filter((x) => x.type === "reasoning")[1].encrypted_content, TOOL_ENC);
+      assert.equal(requests[3].input.find((x) => x.type === "function_call" && x.call_id === "call_tool_1").id, undefined);
+      assert.equal(manager.getBranch().filter((e) => e.customType === "pi-azure-compat:state:v1" && e.data.kind === "rejected").length, 2);
+    }
     assert.ok(tools.has("ctx_reduce"), "real MC tools must be registered");
     const toolOutput = requests[1].input.find((x) => x.type === "function_call_output")?.output;
     assert.ok(String(toolOutput).includes(String.fromCharCode(167)), "real MC tagging must run");
     await session.prompt("Continue again.");
-    assert.equal(requests.length, 3);
-    assert.equal(requests[2].input.some((x) => x.id === "rs_joint" || x.id === "msg_joint" || x.id === "fc_joint"), false);
-    assert.equal(requests[2].input.some((x) => x.id === "msg_fresh_2"), true);
+    assert.equal(requests.length, responseCount + 1);
+    assert.equal(requests.at(-1).input.some((x) => x.id === "rs_joint" || x.id === "msg_joint" || x.id === "fc_joint"), false);
+    assert.equal(requests.at(-1).input.some((x) => x.id === `msg_fresh_${responseCount}`), true);
     // Exercise the real reduction queue and a subsequent materializing transform,
     // after the failed entry has been omitted by context_edit.
     const marker = String.fromCharCode(167);
@@ -139,12 +152,12 @@ async function fixture(order, fallback, manual = false, redacted = false) {
     assert.notEqual(reduction.isError, true, JSON.stringify(reduction));
     await commands.get("ctx-flush").handler("", lastContext);
     await session.prompt("Continue after materializing the queued reduction.");
-    assert.equal(requests.length, 4);
-    assert.equal(JSON.stringify(requests[3].input).includes("reducible-history-output"), false, JSON.stringify(reduction));
-    assert.equal(requests[3].input.some((x) => x.id === "rs_joint" || x.id === "msg_joint" || x.id === "fc_joint"), false);
+    assert.equal(requests.length, responseCount + 2);
+    assert.equal(JSON.stringify(requests.at(-1).input).includes("reducible-history-output"), false, JSON.stringify(reduction));
+    assert.equal(requests.at(-1).input.some((x) => x.id === "rs_joint" || x.id === "msg_joint" || x.id === "fc_joint"), false);
     assert.deepEqual(errors, []);
     assert.deepEqual(unexpectedNetwork, []);
-    return { version, order, fallback, manual, requests: requests.length, contextPasses, extensionErrors: errors.length };
+    return { version, order, fallback, manual, repeated, requests: requests.length, contextPasses, extensionErrors: errors.length };
   } finally {
     if (lastContext) for (const handler of shutDown) await handler({ type: "session_shutdown" }, lastContext);
     session?.dispose();
@@ -174,6 +187,14 @@ for (const order of ["magic-first", "repair-first"]) {
 for (const order of ["magic-first", "repair-first"]) {
   test(`installed Magic Context ${version} + manual clean (${order})`, { timeout: 60000 }, async () => {
     console.log(JSON.stringify(await fixture(order, false, true)));
+  });
+}
+
+// Break caught: real MC projection or queued fallback prevents a successful
+// tool turn from renewing the allowance for newly rejected historical IDs.
+for (const order of ["magic-first", "repair-first"]) for (const fallback of [false, true]) {
+  test(`installed Magic Context ${version} + repeated repair after tool progress (${order}, ${fallback ? "queued fallback" : "standalone"})`, { timeout: 60000 }, async () => {
+    console.log(JSON.stringify(await fixture(order, fallback, false, true, true)));
   });
 }
 

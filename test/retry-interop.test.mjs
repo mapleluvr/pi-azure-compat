@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ENC, runFixture } from "./helpers/fixture.mjs";
+import { ENC, TOOL_ENC, runFixture } from "./helpers/fixture.mjs";
 
 const STATE_TYPE = "pi-azure-compat:state:v1";
 const rejectedEntries = (r) => r.entries.filter((e) => e.type === "custom" && e.customType === STATE_TYPE && e.data.kind === "rejected");
@@ -56,9 +56,28 @@ test("weak resource wording hints once and leaves IDs untouched across queued re
   assert.deepEqual(r.extensionErrors, []);
 });
 
+// Break caught: a successful tool turn does not renew the allowance, leaving
+// the generic retry with the newly rejected IDs or adding a duplicate request.
+for (const order of ["retry-first", "repair-first"]) for (const error of ["resource", "router-masked-resource"]) {
+  test(`queued fallback cleans fresh IDs after progress (${order}, ${error})`, async () => {
+    const r = await runFixture([error, "tool-1", error, "ok"], {
+      [order === "retry-first" ? "precedingExtension" : "trailingExtension"]: queuedFallback(3),
+    });
+    assert.equal(r.requests.length, 4, "each failure reuses exactly one queued retry");
+    assert.deepEqual(r.requests.map((p) => p.input.filter((x) => typeof x.id === "string").length), [3, 0, 3, 0]);
+    assert.equal(rejectedEntries(r).length, 2);
+    assert.equal(r.entries.filter((e) => e.type === "context_edit").length, 2);
+    assert.equal(r.requests[3].input.filter((x) => x.type === "reasoning")[1].encrypted_content, TOOL_ENC);
+    assert.equal(r.requests[3].input.find((x) => x.type === "function_call" && x.call_id === "call_tool_1").id, undefined);
+    assert.equal(r.requests[3].input.find((x) => x.type === "function_call_output" && x.call_id === "call_tool_1").call_id, "call_tool_1");
+    assert.equal(r.lastText, "fixture-ok");
+    assert.deepEqual(r.extensionErrors, []);
+  });
+}
+
 // Break caught: a failed already-cleaned retry causing a second identity repair
 // or an extra settlement request after the generic fallback budget ends.
-test("queued fallback and standalone continuation share one identity-repair budget", async () => {
+test("queued fallback and standalone continuation share one failure-chain repair budget", async () => {
   let serial = 0;
   const r = await runFixture(["resource", "resource", "ok"], {
     precedingExtension: queuedFallback(1),
@@ -67,6 +86,23 @@ test("queued fallback and standalone continuation share one identity-repair budg
   assert.equal(r.requests.length, 2);
   assert.equal(rejectedEntries(r).length, 1);
   assert.deepEqual(r.requests[1].input.filter((x) => typeof x.id === "string").map((x) => x.id), ["msg_new_2"]);
+  assert.deepEqual(r.extensionErrors, []);
+});
+
+// Break caught: an unrelated error or visible partial output is mistaken for
+// successful progress and grants a second repair during uninterrupted failure.
+for (const middle of ["enc", "partial-resource"]) test(`continuous failures retain the allowance across ${middle}`, async () => {
+  let serial = 0;
+  const r = await runFixture(["resource", middle, "resource", "ok"], {
+    precedingExtension: queuedFallback(2),
+    mutatePayload: (p) => p.input.push({ type: "message", id: `msg_attempt_${++serial}`, role: "assistant", content: [] }),
+    captureNotifications: true,
+    afterPrompt: async ({ session }) => session.prompt("/azure-compat status"),
+  });
+  assert.equal(r.requests.length, 3);
+  assert.equal(rejectedEntries(r).length, 1);
+  const status = r.notifications.findLast((n) => n.message.startsWith("pi-azure-compat:"));
+  assert.match(status.message, /strict \(budget\)/);
   assert.deepEqual(r.extensionErrors, []);
 });
 

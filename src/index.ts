@@ -96,7 +96,7 @@ export default function azureCompat(pi: ExtensionAPI): void {
   let pendingContinuationScope: string | undefined;
   let inTurn = false;
   let requestsInTurn = 0;
-  let recoveriesInOperation = 0;
+  let recoveriesInFailureChain = 0;
   let weakHinted = false;
   let lastMatch: ResourceErrorMatch = "none";
   let lastSkip: SkipReason | undefined;
@@ -107,7 +107,7 @@ export default function azureCompat(pi: ExtensionAPI): void {
     pendingContinuationScope = undefined;
     inTurn = false;
     requestsInTurn = 0;
-    recoveriesInOperation = 0;
+    recoveriesInFailureChain = 0;
     weakHinted = false;
   }
   pi.on("session_start", () => {
@@ -167,6 +167,17 @@ export default function azureCompat(pi: ExtensionAPI): void {
 
   pi.on("turn_end", (event, ctx) => {
     inTurn = false;
+    if (event.outcome === "completed" && snapshot && requestsInTurn === 1
+      && !ctx.signal?.aborted && ctx.model && scopeOf(ctx.model) === snapshot.scope) {
+      // Confirm main-request progress from the persisted response, not projected
+      // context, HTTP status, partial output, or merely entering the next turn.
+      const entry = ctx.sessionManager.getBranch().find((value) => value.id === event.messageEntryId);
+      const message = entry?.type === "message" ? entry.message : undefined;
+      if (message?.role === "assistant" && (message.stopReason === "stop" || message.stopReason === "toolUse")
+        && message.provider === snapshot.provider && message.api === snapshot.api && message.model === snapshot.model) {
+        recoveriesInFailureChain = 0;
+      }
+    }
     if (event.outcome !== "error") return;
     lastMatch = "none";
     lastSkip = "message";
@@ -197,10 +208,10 @@ export default function azureCompat(pi: ExtensionAPI): void {
       return;
     }
     if (lastMatch === "none") { lastSkip = "unmatched"; return; }
-    if (recoveriesInOperation >= 1) { lastSkip = "budget"; return; }
+    if (recoveriesInFailureChain >= 1) { lastSkip = "budget"; return; }
 
     const rejected: StateChange = { kind: "rejected", scope: snapshot.scope, ids: snapshot.ids };
-    recoveriesInOperation++;
+    recoveriesInFailureChain++;
     stats.recoveries++;
     pendingContinuationScope = snapshot.scope;
     snapshot = undefined;

@@ -11,7 +11,9 @@
 
 错误判断关联到当前 turn 的 messageEntryId，并在比较前归一化转义换行、ANSI 控制序列和连续空白。
 
-新请求仅清理这批受影响的顶层字符串 ID，保留 encrypted_content、call_id、正文、摘要和其他字段。后续请求继续对这些历史 ID 应用清理；新生成的 ID 正常保留。每次用户操作至最终 settlement 最多准备一次新的身份修复，并由本插件补发至多一次 continuation。
+新请求仅清理这批受影响的顶层字符串 ID，保留 encrypted_content、call_id、正文、摘要和其他字段。后续请求继续对这些历史 ID 应用清理；新生成的 ID 正常保留。一次运行操作内，每条连续失败链最多准备一次新的身份修复，并由本插件补发至多一次 continuation。
+
+成功模型响应结束当前失败链并刷新自动修复额度：turn_end 的 outcome 为 completed，已持久化的 assistant 消息正常结束（stop 或 toolUse），其 provider/API/model 与唯一捕获的符合条件的主请求一致，且当前未取消。随后出现资源身份错误时，插件可以记录当时新出现的历史 ID。普通重试、排队 continuation、上下文重投影、部分输出后失败和其他错误继续共享当前失败链的额度。每次运行初始化或最终 settlement 清空运行期失败链状态；已确认的拒绝 ID 继续随活动分支持久化。
 
 修复状态在 agent_end 之前提交。pi-retry 等流程排入的下一轮请求直接复用这批状态；下一轮 turn_start 消费待续跑标记。没有排队工作时，agent_before_settle 在同一模型 scope、未取消、策略开启且上下文可继续的条件下补一次 continuation。通用重试的普通/Fast 模式及两种加载顺序均适用；它自身的重试预算保持原有行为。
 
@@ -37,7 +39,7 @@
 
 开关和 reset 跟随活动分支持久化。off 暂停待执行手动清理，on 恢复；clean 会主动开启分支开关。计数仅表示本次扩展 runtime 的操作，重载后重新计数。recoveries 统计已准备的自动身份修复次数，不代表服务端成功次数；手动清理计入 cleanedRequests/cleanedIds。
 
-状态中的 last error 形如 `redacted (prepared)`、`weak (unmatched)` 或 `none (unmatched)`：前者是错误分类，括号内是本次未继续自动恢复的原因（如 budget、no-ids、disabled、scope）。该诊断只保留在当前 runtime，不写入会话，也不改变清理行为。
+状态中的 last error 形如 `redacted (prepared)`、`weak (unmatched)` 或 `none (unmatched)`：前者是错误分类，括号内是本次未继续自动恢复的原因（如 budget、no-ids、disabled、scope）。budget 表示当前连续失败链已准备过一次自动修复。该诊断只保留在当前 runtime，不写入会话，也不改变清理行为。
 
 ## 上下文管理与分发
 

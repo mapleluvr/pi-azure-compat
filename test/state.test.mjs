@@ -58,7 +58,7 @@ test("reset restores raw IDs for the current scope", async () => {
 });
 
 // Break caught: a fresh injected identity keeping recovery alive indefinitely.
-test("at most one identity continuation per prompt even if new IDs keep appearing", async () => {
+test("at most one identity continuation per continuous failure chain even if new IDs keep appearing", async () => {
   let serial = 0;
   const r = await runFixture(["resource", "resource", "ok"], {
     mutatePayload: (p) => p.input.push({ type: "message", id: `msg_injected_${++serial}`, role: "assistant", content: [] }),
